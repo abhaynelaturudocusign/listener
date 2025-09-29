@@ -1,57 +1,98 @@
 import os
 import pika
 import logging
+import json
+import requests
 from flask import Flask, request, Response
-
-# Set up detailed logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# --- Configuration ---
-RABBITMQ_URL = "amqps://rbqzmjme:EFGff2DRN2B95OP8a5zy3HN1tV4BQZdM@puffin.rmq2.cloudamqp.com/rbqzmjme"
-QUEUE_NAME = 'docusign_jobs'
-
-#if not RABBITMQ_URL:
- #   logging.critical("FATAL ERROR: RABBITMQ_URL environment variable not set.")
-    # This will cause the worker to fail to boot, which is what we want if the URL is missing.
-  #  raise ValueError("No RABBITMQ_URL set for the Listener application")
+from jose import jwt
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Configuration (from environment variables) ---
+QUEUE_NAME = 'docusign_jobs'
+RABBITMQ_URL = os.environ.get('RABBITMQ_URL')
+COGNITO_USER_POOL_ID = os.environ.get('COGNITO_USER_POOL_ID')
+COGNITO_REGION = os.environ.get('COGNITO_REGION', 'us-east-1') # e.g., us-east-1
+COGNITO_AUDIENCE = os.environ.get('COGNITO_AUDIENCE') # This is the App Client ID from Cognito
+
+# --- JWT Validation ---
+# Construct the JWKS URL from your Cognito settings
+JWKS_URL = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
+JWKS = requests.get(JWKS_URL).json()["keys"]
+
+def validate_jwt(token):
+    """Validates the incoming JWT from DocuSign against AWS Cognito's public keys."""
+    try:
+        # Get the unverified header from the token
+        unverified_header = jwt.get_unverified_header(token)
+        
+        # Find the correct key to use for verification
+        rsa_key = {}
+        for key in JWKS:
+            if key["kid"] == unverified_header["kid"]:
+                rsa_key = {
+                    "kty": key["kty"],
+                    "kid": key["kid"],
+                    "use": key["use"],
+                    "n": key["n"],
+                    "e": key["e"]
+                }
+        
+        if rsa_key:
+            # Decode and validate the token
+            payload = jwt.decode(
+                token,
+                rsa_key,
+                algorithms=["RS256"],
+                audience=COGNITO_AUDIENCE,
+                # The issuer URL for a Cognito user pool
+                issuer=f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}"
+            )
+            logging.info("JWT is valid.")
+            return True
+        
+        logging.warning("JWT validation failed: Unable to find a matching key.")
+        return False
+
+    except Exception as e:
+        logging.error(f"Error during JWT validation: {e}", exc_info=True)
+        return False
 
 @app.route('/docusign_webhook', methods=['POST'])
 def docusign_webhook():
     """
-    Receives a webhook, connects to RabbitMQ, adds the job to the queue,
-    and then closes the connection.
+    Receives the webhook, validates its JWT Bearer token, adds it to the queue,
+    and returns 200 OK.
     """
+    # 1. Validate the JWT Bearer Token
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        logging.warning("Unauthorized webhook: Missing or malformed Authorization header.")
+        return Response("Unauthorized", status=401)
+
+    token = auth_header.split(" ")[1]
+    if not validate_jwt(token):
+        logging.warning("Unauthorized webhook: Invalid JWT.")
+        return Response("Unauthorized", status=401)
+        
+    # 2. If valid, proceed to queue the message
     connection = None
     try:
-        # 1. Connect to RabbitMQ for this specific request
-        logging.info("Attempting to connect to RabbitMQ...")
         connection = pika.BlockingConnection(pika.URLParameters(RABBITMQ_URL))
         channel = connection.channel()
-        logging.info("Successfully connected to RabbitMQ.")
-
-        # 2. Ensure the queue exists
         channel.queue_declare(queue=QUEUE_NAME, durable=True)
-
-        # 3. Publish the message
         channel.basic_publish(
             exchange='',
             routing_key=QUEUE_NAME,
             body=request.get_data(),
-            properties=pika.BasicProperties(
-                delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
-            ))
-        
-        logging.info("Successfully queued a new job.")
+            properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE)
+        )
+        logging.info("Successfully queued a validated job.")
         return Response("Webhook Acknowledged", status=200)
-
     except Exception as e:
-        # This will now print the detailed Python error to your log
-        logging.error(f"An unexpected error occurred: {e}", exc_info=True)
+        logging.error(f"Error while queueing webhook: {e}", exc_info=True)
         return Response("Internal Server Error", status=500)
     finally:
-        # 4. Ensure the connection is closed
         if connection and connection.is_open:
             connection.close()
-            logging.info("RabbitMQ connection closed.")
