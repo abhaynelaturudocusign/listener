@@ -65,6 +65,13 @@ def docusign_webhook():
     Receives the webhook, validates its JWT Bearer token, adds it to the queue,
     and returns 200 OK.
     """
+    # --- ADD THIS BLOCK TO PRINT HEADERS ---
+    logging.info("--- Incoming Request Headers ---")
+    for key, value in request.headers:
+        logging.info(f"{key}: {value}")
+    logging.info("------------------------------")
+    # --- END OF BLOCK ---
+
     # 1. Validate the JWT Bearer Token
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
